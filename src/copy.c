@@ -244,6 +244,16 @@ create_hole (int fd, char const *name, bool punch_holes, off_t size)
   return true;
 }
 
+// PG MOD STARTS
+static FileHandlerBase*
+remote_sparse_copy(int src_fd, int dest_fd, char *buf, size_t buf_size,
+             size_t hole_size, bool punch_holes,
+             char const *src_name, char const *dst_name,
+             uintmax_t max_n_read)
+{
+  return  queue_file(src_fd, dest_fd, max_n_read, src_name, dst_name);
+}
+// PG MOD ENDS __LINE__ + 10
 
 /* Copy the regular file open on SRC_FD/SRC_NAME to DST_FD/DST_NAME,
    honoring the MAKE_HOLES setting and using the BUF_SIZE-byte buffer
@@ -275,7 +285,7 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
         {
           if (errno == EINTR)
             continue;
-          error (0, errno, _("error reading %s"), quoteaf (src_name));
+          error (0, errno, _("error reading %s"), quoteaf (src_name));          //printf("Error");
           return false;
         }
       if (n_read == 0)
@@ -347,7 +357,6 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
         }
 
       *last_write_made_hole = make_hole;
-
       /* It's tempting to break early here upon a short read from
          a regular file.  That would save the final read syscall
          for each file.  Unfortunately that doesn't work for
@@ -360,6 +369,7 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
     return false;
   else
     return true;
+
 }
 
 /* Perform the O(1) btrfs clone operation, if possible.
@@ -1052,7 +1062,7 @@ copy_reg (char const *src_name, char const *dst_name,
           mode_t dst_mode, mode_t omitted_permissions, bool *new_dst,
           struct stat const *src_sb)
 {
-  char *buf;
+  char *buf = NULL;
   char *buf_alloc = NULL;
   char *name_alloc = NULL;
   int dest_desc;
@@ -1063,7 +1073,7 @@ copy_reg (char const *src_name, char const *dst_name,
   struct stat src_open_sb;
   bool return_val = true;
   bool data_copy_required = x->data_copy_required;
-
+  FileHandlerBase* signalClose = NULL;                                                        //printf("cp REG: %s %s\n", src_name, dst_name);
   source_desc = open (src_name,
                       (O_RDONLY | O_BINARY
                        | (x->dereference == DEREF_NEVER ? O_NOFOLLOW : 0)));
@@ -1278,74 +1288,93 @@ copy_reg (char const *src_name, char const *dst_name,
             make_holes = true;
         }
 
-      /* If not making a sparse file, try to use a more-efficient
-         buffer size.  */
-      if (! make_holes)
+      // PG MOD STARTS
+      if (file_is_intercepted(source_desc) || file_is_intercepted(dest_desc))
         {
-          /* Compute the least common multiple of the input and output
-             buffer sizes, adjusting for outlandish values.  */
-          size_t blcm_max = MIN (SIZE_MAX, SSIZE_MAX) - buf_alignment;
-          size_t blcm = buffer_lcm (io_blksize (src_open_sb), buf_size,
-                                    blcm_max);
+          /* One of the files is a cloud special. Note this may be problematic if we ever spoof these F_GETFL results. We may need to reserve some high bits for our own purposes. */
+          signalClose = remote_sparse_copy(source_desc, dest_desc, buf, buf_size,
+                            make_holes ? hole_size : 0,
+                            x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
+                            UINTMAX_MAX);
 
-          /* Do not bother with a buffer larger than the input file, plus one
-             byte to make sure the file has not grown while reading it.  */
-          if (S_ISREG (src_open_sb.st_mode) && src_open_sb.st_size < buf_size)
-            buf_size = src_open_sb.st_size + 1;
+          /* if we don't intercept, then the file will be correctly copied, but in the foreground */
 
-          /* However, stick with a block size that is a positive multiple of
-             blcm, overriding the above adjustments.  Watch out for
-             overflow.  */
-          buf_size += blcm - 1;
-          buf_size -= buf_size % blcm;
-          if (buf_size == 0 || blcm_max < buf_size)
-            buf_size = blcm;
+
+
         }
-
-      buf_alloc = xmalloc (buf_size + buf_alignment);
-      buf = ptr_align (buf_alloc, buf_alignment);
-
-      if (sparse_src)
+      if (!signalClose)
         {
-          bool normal_copy_required;
+      // PG MOD ENDS __LINE__ + 30
 
-          /* Perform an efficient extent-based copy, falling back to the
-             standard copy only if the initial extent scan fails.  If the
-             '--sparse=never' option is specified, write all data but use
-             any extents to read more efficiently.  */
-          if (extent_copy (source_desc, dest_desc, buf, buf_size, hole_size,
-                           src_open_sb.st_size,
-                           make_holes ? x->sparse_mode : SPARSE_NEVER,
-                           src_name, dst_name, &normal_copy_required))
-            goto preserve_metadata;
+          /* If not making a sparse file, try to use a more-efficient
+            buffer size.  */
+          if (! make_holes)
+            {
+              /* Compute the least common multiple of the input and output
+                buffer sizes, adjusting for outlandish values.  */
+              size_t blcm_max = MIN (SIZE_MAX, SSIZE_MAX) - buf_alignment;
+              size_t blcm = buffer_lcm (io_blksize (src_open_sb), buf_size,
+                                        blcm_max);
 
-          if (! normal_copy_required)
+              /* Do not bother with a buffer larger than the input file, plus one
+                byte to make sure the file has not grown while reading it.  */
+              if (S_ISREG (src_open_sb.st_mode) && src_open_sb.st_size < buf_size)
+                buf_size = src_open_sb.st_size + 1;
+
+              /* However, stick with a block size that is a positive multiple of
+                blcm, overriding the above adjustments.  Watch out for
+                overflow.  */
+              buf_size += blcm - 1;
+              buf_size -= buf_size % blcm;
+              if (buf_size == 0 || blcm_max < buf_size)
+                buf_size = blcm;
+            }
+
+          buf_alloc = xmalloc (buf_size + buf_alignment);
+          buf = ptr_align (buf_alloc, buf_alignment);
+
+          if (sparse_src)
+            {
+              bool normal_copy_required;
+
+              /* Perform an efficient extent-based copy, falling back to the
+                standard copy only if the initial extent scan fails.  If the
+                '--sparse=never' option is specified, write all data but use
+                any extents to read more efficiently.  */
+              if (extent_copy (source_desc, dest_desc, buf, buf_size, hole_size,
+                              src_open_sb.st_size,
+                              make_holes ? x->sparse_mode : SPARSE_NEVER,
+                              src_name, dst_name, &normal_copy_required))
+                goto preserve_metadata;
+
+              if (! normal_copy_required)
+                {
+                  return_val = false;
+                  goto close_src_and_dst_desc;
+                }
+            }
+
+          off_t n_read;
+          bool wrote_hole_at_eof;
+          if (! sparse_copy (source_desc, dest_desc, buf, buf_size,
+                            make_holes ? hole_size : 0,
+                            x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
+                            UINTMAX_MAX, &n_read,
+                            &wrote_hole_at_eof))
             {
               return_val = false;
               goto close_src_and_dst_desc;
             }
-        }
-
-      off_t n_read;
-      bool wrote_hole_at_eof;
-      if (! sparse_copy (source_desc, dest_desc, buf, buf_size,
-                         make_holes ? hole_size : 0,
-                         x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
-                         UINTMAX_MAX, &n_read,
-                         &wrote_hole_at_eof))
-        {
-          return_val = false;
-          goto close_src_and_dst_desc;
-        }
-      else if (wrote_hole_at_eof && ftruncate (dest_desc, n_read) < 0)
-        {
-          error (0, errno, _("failed to extend %s"), quoteaf (dst_name));
-          return_val = false;
-          goto close_src_and_dst_desc;
-        }
+          else if (wrote_hole_at_eof && ftruncate (dest_desc, n_read) < 0)
+            {
+              error (0, errno, _("failed to extend %s"), quoteaf (dst_name));
+              return_val = false;
+              goto close_src_and_dst_desc;
+            }
+        } // PG __LINE + 31
     }
-
 preserve_metadata:
+  assert(check_job_is_valid(signalClose) && " timestamps");
   if (x->preserve_timestamps)
     {
       struct timespec timespec[2];
@@ -1365,6 +1394,7 @@ preserve_metadata:
 
   /* Set ownership before xattrs as changing owners will
      clear capabilities.  */
+  assert(check_job_is_valid(signalClose) && " owner");
   if (x->preserve_ownership && ! SAME_OWNER_AND_GROUP (*src_sb, sb))
     {
       switch (set_owner (x, dst_name, dest_desc, src_sb, *new_dst, &sb))
@@ -1382,6 +1412,7 @@ preserve_metadata:
   /* To allow copying xattrs on read-only files, temporarily chmod u+rw.
      This workaround is required as an inode permission check is done
      by xattr_permission() in fs/xattr.c of the GNU/Linux kernel tree.  */
+  assert(check_job_is_valid(signalClose) && " xattr");
   if (x->preserve_xattr)
     {
       bool access_changed = false;
@@ -1400,8 +1431,10 @@ preserve_metadata:
         fchmod_or_lchmod (dest_desc, dst_name, dst_mode & ~omitted_permissions);
     }
 
+  assert(check_job_is_valid(signalClose) && " author");
   set_author (dst_name, dest_desc, src_sb);
 
+  assert(check_job_is_valid(signalClose) && " mode");
   if (x->preserve_mode || x->move_mode)
     {
       if (copy_acl (src_name, source_desc, dst_name, dest_desc, src_mode) != 0
@@ -1430,19 +1463,39 @@ preserve_metadata:
             return_val = false;
         }
     }
+  assert(check_job_is_valid(signalClose) && " close");
 
+// PG MOD
 close_src_and_dst_desc:
-  if (close (dest_desc) < 0)
+  if (allow_job_close(signalClose))
+    {
+      dest_desc = -1;
+      source_desc = -1;
+    }
+  else if (close (dest_desc) < 0)
     {
       error (0, errno, _("failed to close %s"), quoteaf (dst_name));
       return_val = false;
     }
+
 close_src_desc:
-  if (close (source_desc) < 0)
+  if (source_desc != -1)
     {
-      error (0, errno, _("failed to close %s"), quoteaf (src_name));
-      return_val = false;
+      if (allow_job_close(signalClose))
+        {
+          // "source_desc != -1" is only necessary to get here -
+          // should never get here because already done close_src_and_dst_desc, or signalClose should be null
+          // object behind signalClose may be recycled after previous *signalClose = 0
+          dest_desc = -1;
+          source_desc = -1;
+        }
+      else if (close (source_desc) < 0)
+        {
+          error (0, errno, _("failed to close %s"), quoteaf (src_name));
+          return_val = false;
+        }
     }
+// PG MOD END __LINE_ + 50
 
   free (buf_alloc);
   free (name_alloc);
@@ -1946,7 +1999,7 @@ copy_internal (char const *src_name, char const *dst_name,
       memset (&src_sb, 0, sizeof src_sb);
     }
 #endif
-
+                                                               //printf("Copy Internal: %s %s %i\n", src_name, dst_name, S_ISDIR (src_mode));
   /* Detect the case in which the same source file appears more than
      once on the command line and no backup option has been selected.
      If so, simply warn and don't copy it the second time.
@@ -3021,10 +3074,12 @@ copy (char const *src_name, char const *dst_name,
   top_level_dst_name = dst_name;
 
   bool first_dir_created_per_command_line_arg = false;
-  return copy_internal (src_name, dst_name, nonexistent_dst, NULL, NULL,
+  bool copy_intern = copy_internal (src_name, dst_name, nonexistent_dst, NULL, NULL,
                         options, true,
                         &first_dir_created_per_command_line_arg,
                         copy_into_self, rename_succeeded);
+  trigger_join(copy_intern); // PG MOD
+  return copy_intern;
 }
 
 /* Set *X to the default options for a value of type struct cp_options.  */
