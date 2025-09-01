@@ -35,19 +35,28 @@ typedef struct FileHandlerBase  {}  FileHandlerBase; /**< Opaque base to petagen
    or if partial writes occur.  Return the number of bytes successfully
    written, setting errno if that is less than COUNT.  */
 extern size_t full_write (int fd, const void *buf, size_t count);
+
 /* Queue the file copy for writing.
    Returns a pointer to a control value that should be allow_job_close() by the caller when it no longer wants the file handles.
 */
 extern FileHandlerBase* queue_file(int src_fd, int fd, size_t max_read, const char* src_name, const char* dst_name);
+
 /** At the end of all copy requests, wait for the remaining jobs to complete */
-extern void trigger_join(int i);
+extern int trigger_join(int i);
+
 /** Tests the file handle to see if cuno has intercepted its open() */
 extern int file_is_intercepted(int src_fd);
+
 /** returns true if opaque points to a valid job. False if opaque is NULL */
 extern int check_job_is_valid(FileHandlerBase*  opaque);
 
+/** returns true if opaque points to a valid job. False if opaque is NULL, also if possible return false if job has finished copying! */
+extern int register_utimens(FileHandlerBase*  opaque, struct timespec newTimes[2]);
+
 /** returns true if opaque points to a valid job, aand triggers a file close. False if opaque is NULL, and caller should close */
 extern int allow_job_close(FileHandlerBase*  opaque);
+
+
 
 #ifdef __cplusplus
 }

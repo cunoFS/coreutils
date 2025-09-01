@@ -244,6 +244,8 @@ create_hole (int fd, char const *name, bool punch_holes, off_t size)
   return true;
 }
 
+#include "../cpp_src/full-write-tmp.h"
+
 // PG MOD STARTS
 static FileHandlerBase*
 remote_sparse_copy(int src_fd, int dest_fd, char *buf, size_t buf_size,
@@ -1073,7 +1075,7 @@ copy_reg (char const *src_name, char const *dst_name,
   struct stat src_open_sb;
   bool return_val = true;
   bool data_copy_required = x->data_copy_required;
-  FileHandlerBase* signalClose = NULL;                                                        //printf("cp REG: %s %s\n", src_name, dst_name);
+  FileHandlerBase* signalClose = NULL;
   source_desc = open (src_name,
                       (O_RDONLY | O_BINARY
                        | (x->dereference == DEREF_NEVER ? O_NOFOLLOW : 0)));
@@ -1390,6 +1392,7 @@ preserve_metadata:
               goto close_src_and_dst_desc;
             }
         }
+      register_utimens(signalClose, timespec);  // PG MOD: Flag a time to be set again when modifications have finished
     }
 
   /* Set ownership before xattrs as changing owners will
@@ -1466,7 +1469,7 @@ preserve_metadata:
   assert(check_job_is_valid(signalClose) && " close");
 
 // PG MOD
-close_src_and_dst_desc:
+close_src_and_dst_desc:  // Default path OR Goto this label means there was an error after opening both files
   if (allow_job_close(signalClose))
     {
       dest_desc = -1;
@@ -1478,7 +1481,7 @@ close_src_and_dst_desc:
       return_val = false;
     }
 
-close_src_desc:
+close_src_desc:  // Goto this label means there was an error opening the dest file.
   if (source_desc != -1)
     {
       if (allow_job_close(signalClose))
@@ -3078,7 +3081,10 @@ copy (char const *src_name, char const *dst_name,
                         options, true,
                         &first_dir_created_per_command_line_arg,
                         copy_into_self, rename_succeeded);
-  trigger_join(copy_intern); // PG MOD
+  int err = trigger_join(copy_intern); // PG MOD
+  if (err != 0) {
+    error (err, errno, _("Failed to copy file %s"), quoteaf (src_name));
+  }
   return copy_intern;
 }
 

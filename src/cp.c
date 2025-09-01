@@ -43,6 +43,9 @@
 /* The official name of this program (e.g., no 'g' prefix).  */
 #define PROGRAM_NAME "cp"
 
+#define PROGRAM_NAME_CUNO_VERSION PROGRAM_NAME " for Object Mount (cuno-cp)"        // PG mod - runtime version ID
+
+
 #define AUTHORS \
   proper_name ("Torbjorn Granlund"), \
   proper_name ("David MacKenzie"), \
@@ -145,7 +148,8 @@ usage (int status)
     emit_try_help ();
   else
     {
-      printf (_("\
+      printf (_( \
+PROGRAM_NAME_CUNO_VERSION "\n\                          // PG mod - runtime version ID
 Usage: %s [OPTION]... [-T] SOURCE DEST\n\
   or:  %s [OPTION]... SOURCE... DIRECTORY\n\
   or:  %s [OPTION]... -t DIRECTORY SOURCE...\n\
@@ -1133,7 +1137,7 @@ main (int argc, char **argv)
 
         case_GETOPT_HELP_CHAR;
 
-        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        case_GETOPT_VERSION_CHAR (PROGRAM_NAME_CUNO_VERSION, AUTHORS);              // PG mod - runtime version ID
 
         default:
           usage (EXIT_FAILURE);

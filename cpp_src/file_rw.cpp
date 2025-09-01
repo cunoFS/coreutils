@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <cstdint>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <assert.h>
 #include <stdarg.h>
@@ -57,6 +58,7 @@ struct RecordOp
     OP_DEL ,
     OP_CHK ,
     OP_ALLOW,
+    OP_MTIME,
     OP_MAX,
     MAX_RECORDS = 2000000
   } op;
@@ -249,11 +251,15 @@ bool isValid(void *p)
 #endif
 
 class FileHandler: public FileHandlerBase {
+public:
+    using CallBackRawFn = void (int, int, int, const struct timespec[2]);
+    typedef std::function<CallBackRawFn> CallBackStdFn;
+private:
     int src_fd_;
     int dst_fd_;
     uintmax_t max_read_;
     std::shared_ptr<std::thread> writer_thread_;
-    std::function<void(int, int, int)> free_callback_;
+    CallBackStdFn free_callback_;
     bool terminated_;
     std::mutex write_mutex_;
     bool is_complete_;
@@ -261,11 +267,16 @@ class FileHandler: public FileHandlerBase {
     int index_;
     bool active_;
     bool finished_;
-public:
-    volatile int closeWhenZero_;
+
+    struct timespec utimens_[2] = {{0, UTIME_OMIT },{0, UTIME_OMIT }};
 
 public:
-    FileHandler(int index, std::function<void(int, int, int)> free_callback) {
+    volatile int closeWhenZero_;
+    volatile int return_status_ {0};
+    volatile int return_errno_ {0};
+
+public:
+    FileHandler(int index, CallBackStdFn free_callback) {
         index_ = index;
         src_fd_ = -1;
         dst_fd_ = -1;
@@ -279,6 +290,14 @@ public:
     }
 
     ~FileHandler() {
+    }
+
+    bool Active() const  {   return active_; }
+    void SetTimes(const struct timespec& atime0, const struct timespec& mtime1)
+    {
+        utimens_[0] = atime0;
+        utimens_[1] = mtime1;
+
     }
 
     void Finish() {
@@ -362,7 +381,11 @@ public:
             while (max_read > 0) {
                 ssize_t written_size = sendfile(dest_fd, src_fd, NULL, max_read);
                 if (written_size < 0) {
-                    if (errno != EINVAL && errno != ENOSYS) { SetExitCode(-1); }
+                    if (errno != EINVAL && errno != ENOSYS) {
+                      return_status_ = -1;
+                      return_errno_ = errno;
+                      SetExitCode(-1);
+                    }
                     break;
                 }
                 else if (written_size == 0) { break; }
@@ -386,7 +409,7 @@ public:
                     RecordTheOp(RecordOp::OP_PREDEL, this);
                     clrValid(this);
                   #endif
-                    free_callback_(index_, src_fd_, dst_fd_);
+                    free_callback_(index_, src_fd_, dst_fd_, utimens_);
                 }
             }
         }
@@ -400,13 +423,17 @@ class FileHandlerPool {
         std::vector<int> free_indexes;
         std::condition_variable cond_var_;
         int max_file_queue_ = 5;
-        std::function<void(int, int, int)> free_callback_;
+        FileHandler::CallBackStdFn free_callback_;
         bool terminated_ {false};
+
+   public:
+        std::atomic<int> error_val_ {0};
+        std::atomic<int> errno_val_ {0};
 
     public:
         FileHandlerPool(int max_queue_size) {
             max_file_queue_ = max_queue_size;
-            free_callback_ = std::bind(&FileHandlerPool::FreeFileHandler, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3);
+            free_callback_ = std::bind(&FileHandlerPool::FreeFileHandler, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4);
             terminated_ = false;
 
             for(int i = 0; i < max_file_queue_; i++) {
@@ -424,7 +451,12 @@ class FileHandlerPool {
             std::map<int, std::shared_ptr<FileHandler>>::iterator it;
             for (it = file_queue_.begin(); it != file_queue_.end(); it++)
             {
-                it->second->Finish();
+                const auto& file_handler = it->second;
+                file_handler->Finish();
+                if (file_handler->return_status_ != 0 && error_val_ == 0) {
+                    error_val_ = file_handler->return_status_;
+                    errno_val_ = file_handler->return_errno_;
+                }
             }
             file_queue_.clear();
         }
@@ -453,16 +485,24 @@ class FileHandlerPool {
             //Terminate and clear up active fds
             for(auto const& file : file_queue_) {
                 file.second->Terminate();
+                if (file.second->return_status_ != 0 && error_val_ == 0) {
+                    error_val_ = file.second->return_status_;
+                    errno_val_ = file.second->return_errno_;
+                }
             }
             file_queue_.clear();
         }
 
-        void FreeFileHandler(int index, int src_fd, int dest_fd) {
+        void FreeFileHandler(int index, int src_fd, int dest_fd, const struct timespec utimens[2]) {
             std::unique_lock<std::mutex> guard(file_handler_mutex);
             //LogMessage(std::string("Free File Handle: ") + std::to_string(src_fd));
             if(src_fd != -1) {
                 free_indexes.push_back(index);
                 //LogMessage(std::string("Closing File Handles: ") + std::to_string(src_fd) + " " + std::to_string(dest_fd));
+                if ((utimens[0].tv_sec && utimens[0].tv_nsec != UTIME_OMIT) || (utimens[1].tv_sec && utimens[1].tv_nsec != UTIME_OMIT))
+                {
+                    futimens(dest_fd, utimens);
+                }
                 close(src_fd);
                 close(dest_fd);
                 src_fd = -1;
@@ -517,10 +557,15 @@ int SetExitCode(int exit_code) {
     return exitcode;
 }
 
-extern "C" void trigger_join(int i) {
+extern "C" int trigger_join(int i) {
     //LogMessage(std::string("Trigger Join"));
     auto handler_pool = GetFileHandlerPool(true);
     handler_pool->Finish();
+    int ret_err = handler_pool->error_val_;
+    if (ret_err != 0) {
+        errno = handler_pool->errno_val_;
+    }
+    return ret_err;
 }
 
 extern "C" FileHandlerBase* queue_file(int src_fd, int fd, uintmax_t max_read, const char* src_name, const char* dst_name) {
@@ -543,15 +588,35 @@ extern "C" FileHandlerBase* queue_file(int src_fd, int fd, uintmax_t max_read, c
 
 
 
-
+#define F_IS_CUNO_INTERCEPT 040010001
 /**
   Detect that this is a cloud special file
 */
 extern "C" int file_is_intercepted(int src_fd)
 {
-  /* NOTE: this may be problematic if we ever spoof these F_GETFL results. We may need to reserve some high bits for our own purposes. */
-  int source_fctl = fcntl(src_fd,F_GETFL);
+  int source_fctl = fcntl(src_fd,F_IS_CUNO_INTERCEPT);
   return (source_fctl != -1) && (source_fctl & OX_PATH);
+}
+
+extern int register_utimens(FileHandlerBase*  opaque, struct timespec newTimes[2])
+{
+    if (!opaque)
+        return false; // Not in threaded job mode!
+
+    FileHandler* base = static_cast<FileHandler*>(opaque);
+#ifdef CALL_LOG_ALL_POINTERS
+    assert (isValid(base));
+    RecordTheOp(RecordOp::OP_MTIME, opaque);
+#endif
+    // TODO: return false if file copy is already completed.
+    if (!base->Active())
+        return false;
+
+    if (!newTimes || (newTimes[0].tv_nsec == UTIME_OMIT && newTimes[1].tv_nsec == UTIME_OMIT))
+        return false;
+    base->SetTimes(newTimes[0], newTimes[1]);
+
+    return true;
 }
 
 
